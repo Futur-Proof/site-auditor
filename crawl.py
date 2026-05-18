@@ -70,6 +70,8 @@ def parse_args():
     p.add_argument("--cdx-timeout", type=int, default=60)
     p.add_argument("--skip-cdx", action="store_true")
     p.add_argument("--skip-infer", action="store_true")
+    p.add_argument("--show-inferred", action="store_true",
+                   help="Include inferred short-slug 404s in the report (noisy without GSC data)")
     p.add_argument("--probes", default="", help="Extra paths to probe, comma-separated")
     p.add_argument("--output", default="results", help="Output directory")
     return p.parse_args()
@@ -357,10 +359,18 @@ def crawl(base_url, delay, cdx_timeout, skip_cdx, skip_infer, extra_probes):
 BROKEN_STATUSES = (404, 410, "ERROR", "200-EMPTY")
 
 
-def build_report(base_url, results):
-    broken = [r for r in results if r["status"] in BROKEN_STATUSES]
+def is_inferred(result):
+    return result["source"].startswith("inferred(")
+
+
+def build_report(base_url, results, show_inferred=False):
+    all_broken = [r for r in results if r["status"] in BROKEN_STATUSES]
     redirects = [r for r in results if r["redirect_chain"]]
     live = [r for r in results if r["status"] == 200]
+
+    # by default suppress inferred 404s — they're hypothetical without GSC data
+    broken = all_broken if show_inferred else [r for r in all_broken if not is_inferred(r)]
+    hidden_count = len(all_broken) - len(broken)
 
     lines = []
     lines.append("=" * 70)
@@ -371,6 +381,8 @@ def build_report(base_url, results):
     lines.append(f"\n  LIVE (200):      {len(live)}")
     lines.append(f"  REDIRECTS:       {len(redirects)}")
     lines.append(f"  BROKEN/EMPTY:    {len(broken)}")
+    if hidden_count:
+        lines.append(f"  (+ {hidden_count} inferred short-slug 404s hidden — run with --show-inferred to include)")
 
     if broken:
         lines.append("\n--- BROKEN / EMPTY ---")
@@ -433,7 +445,7 @@ if __name__ == "__main__":
         extra_probes=extra_probes,
     )
 
-    report_text = build_report(base_url, results)
+    report_text = build_report(base_url, results, show_inferred=args.show_inferred)
     print("\n" + report_text)
 
     json_path, txt_path = save_results(base_url, results, args.output)
