@@ -124,24 +124,44 @@ def parse_sitemap(url, visited_sitemaps=None):
 
 # ── CDX (Wayback + Common Crawl via cdx-toolkit) ─────────────────────────────
 
+CDX_SOURCE_TIMEOUT = 60  # seconds per source before giving up
+
+
 def fetch_cdx_source(source_name, source_key, host):
     """
     Fetch historical URLs from one CDX source using cdx-toolkit.
     source_key: 'ia' (Internet Archive) or 'cc' (Common Crawl)
+    Runs in a thread with a hard timeout so a slow/hung source doesn't block.
     Returns dict of {normalized_url: last_known_statuscode}
     """
-    urls = {}
-    try:
-        cdx = cdx_toolkit.CDXFetcher(source=source_key)
-        for obj in cdx.iter(f"{host}/*", fl="original,statuscode", limit=5000):
-            url = obj.get("original", "")
-            status = obj.get("statuscode", "-")
-            if url and is_internal(url) and not is_asset(url):
-                n = normalize(url)
-                urls[n] = status
-    except Exception as e:
-        print(f"    [{source_name}] error: {e}")
-    return urls
+    import queue
+    import threading
+
+    result_q = queue.Queue()
+
+    def _fetch():
+        urls = {}
+        try:
+            cdx = cdx_toolkit.CDXFetcher(source=source_key)
+            for obj in cdx.iter(f"{host}/*", fl="original,statuscode", limit=5000):
+                url = obj.get("original", "")
+                status = obj.get("statuscode", "-")
+                if url and is_internal(url) and not is_asset(url):
+                    n = normalize(url)
+                    urls[n] = status
+        except Exception as e:
+            print(f"    [{source_name}] error: {e}")
+        result_q.put(urls)
+
+    t = threading.Thread(target=_fetch, daemon=True)
+    t.start()
+    t.join(timeout=CDX_SOURCE_TIMEOUT)
+
+    if t.is_alive():
+        print(f"    [{source_name}] timed out after {CDX_SOURCE_TIMEOUT}s — skipping")
+        return {}
+
+    return result_q.get()
 
 
 def historical_urls(domain):
