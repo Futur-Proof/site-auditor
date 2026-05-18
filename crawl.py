@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Site auditor — discovers URLs via four sources:
+Site auditor — discovers URLs via five sources:
   1. Live crawl (HTML link extraction)
   2. Sitemap (XML, recursive)
-  3. Wayback Machine CDX API (historical URLs)
-  4. Short-slug inference (abbreviated candidates from full slugs)
+  3. Wayback Machine CDX (Internet Archive historical URLs)
+  4. Common Crawl CDX (independent corpus via cdx-toolkit)
+  5. Short-slug inference (abbreviated candidates from full slugs)
 
 Usage:
   python crawl.py [base_url]
@@ -17,15 +18,13 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from urllib.parse import urljoin, urlparse
 
+import cdx_toolkit
 import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = sys.argv[1].rstrip("/") if len(sys.argv) > 1 else "https://www.alpharank.ai"
 PARSED_BASE = urlparse(BASE_URL)
 DELAY = 0.3
-CDX_TIMEOUT = 30
-CDX_RETRIES = 3
-CDX_RETRY_DELAY = 5
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SiteAuditor/2.0)"}
 session = requests.Session()
@@ -123,158 +122,47 @@ def parse_sitemap(url, visited_sitemaps=None):
     return urls
 
 
-# ── Wayback CDX ───────────────────────────────────────────────────────────────
+# ── CDX (Wayback + Common Crawl via cdx-toolkit) ─────────────────────────────
 
-def cdx_fetch_page(domain, page, page_size=5):
-    """Fetch one page of CDX results using pagination."""
-    params = {
-        "url": f"{domain}/*",
-        "output": "json",
-        "fl": "original,statuscode",
-        "collapse": "urlkey",
-        "filter": "!mimetype:warc/revisit",
-        "page": page,
-        "pageSize": page_size,
-    }
-    for attempt in range(CDX_RETRIES):
-        try:
-            r = requests.get(
-                "http://web.archive.org/cdx/search/cdx",
-                params=params,
-                timeout=CDX_TIMEOUT,
-            )
-            if r.status_code == 200:
-                return r.json()
-            elif r.status_code == 503:
-                print(f"    CDX 503, retrying in {CDX_RETRY_DELAY}s... (attempt {attempt+1}/{CDX_RETRIES})")
-                time.sleep(CDX_RETRY_DELAY)
-            else:
-                print(f"    CDX returned {r.status_code}")
-                return []
-        except requests.exceptions.Timeout:
-            print(f"    CDX timeout, retrying in {CDX_RETRY_DELAY}s... (attempt {attempt+1}/{CDX_RETRIES})")
-            time.sleep(CDX_RETRY_DELAY)
-        except Exception as e:
-            print(f"    CDX error: {e}")
-            return []
-    return []
-
-
-def cdx_num_pages(domain, page_size=5):
-    """Get total page count from CDX."""
-    params = {
-        "url": f"{domain}/*",
-        "output": "json",
-        "collapse": "urlkey",
-        "filter": "!mimetype:warc/revisit",
-        "showNumPages": "true",
-        "pageSize": page_size,
-    }
-    for attempt in range(CDX_RETRIES):
-        try:
-            r = requests.get(
-                "http://web.archive.org/cdx/search/cdx",
-                params=params,
-                timeout=CDX_TIMEOUT,
-            )
-            if r.status_code == 200:
-                text = r.text.strip()
-                return int(text) if text.isdigit() else 0
-            elif r.status_code == 503:
-                time.sleep(CDX_RETRY_DELAY)
-        except (requests.exceptions.Timeout, Exception):
-            time.sleep(CDX_RETRY_DELAY)
-    return 0
-
-
-def wayback_urls(domain):
-    """Pull all historical URLs from Wayback CDX with pagination + resumption fallback."""
-    print("  [CDX] Querying Wayback Machine...")
-    host = urlparse(domain).netloc or domain
-
-    # try pagination first
-    num_pages = cdx_num_pages(host)
-    urls = {}  # url -> last known status code
-
-    if num_pages > 0:
-        print(f"  [CDX] {num_pages} page(s) to fetch")
-        for page in range(num_pages):
-            rows = cdx_fetch_page(host, page)
-            if not rows:
-                continue
-            header = rows[0]
-            orig_idx = header.index("original") if "original" in header else 0
-            status_idx = header.index("statuscode") if "statuscode" in header else 1
-            for row in rows[1:]:
-                url = row[orig_idx]
-                status = row[status_idx] if len(row) > status_idx else "-"
-                if is_internal(url) and not is_asset(url):
-                    n = normalize(url)
-                    urls[n] = status
-            time.sleep(0.5)
-    else:
-        # fallback: resumption key method
-        print("  [CDX] Pagination unavailable, using resumption key...")
-        resume_key = None
-        batch = 0
-        while True:
-            params = {
-                "url": f"{host}/*",
-                "output": "json",
-                "fl": "original,statuscode",
-                "collapse": "urlkey",
-                "filter": "!mimetype:warc/revisit",
-                "limit": 500,
-                "showResumeKey": "true",
-            }
-            if resume_key:
-                params["resumeKey"] = resume_key
-
-            rows = []
-            for attempt in range(CDX_RETRIES):
-                try:
-                    r = requests.get(
-                        "http://web.archive.org/cdx/search/cdx",
-                        params=params,
-                        timeout=CDX_TIMEOUT,
-                    )
-                    if r.status_code == 200:
-                        rows = r.json()
-                        break
-                    time.sleep(CDX_RETRY_DELAY)
-                except Exception:
-                    time.sleep(CDX_RETRY_DELAY)
-
-            if not rows:
-                break
-
-            header = rows[0]
-            orig_idx = header.index("original") if "original" in header else 0
-            status_idx = header.index("statuscode") if "statuscode" in header else 1
-
-            # last row may be resume key
-            last = rows[-1]
-            if len(last) == 1:
-                resume_key = last[0]
-                data_rows = rows[1:-1]
-            else:
-                resume_key = None
-                data_rows = rows[1:]
-
-            for row in data_rows:
-                url = row[orig_idx]
-                status = row[status_idx] if len(row) > status_idx else "-"
-                if is_internal(url) and not is_asset(url):
-                    n = normalize(url)
-                    urls[n] = status
-
-            batch += 1
-            if not resume_key:
-                break
-            time.sleep(0.5)
-
-    print(f"  [CDX] Found {len(urls)} unique historical URLs")
+def fetch_cdx_source(source_name, source_key, host):
+    """
+    Fetch historical URLs from one CDX source using cdx-toolkit.
+    source_key: 'ia' (Internet Archive) or 'cc' (Common Crawl)
+    Returns dict of {normalized_url: last_known_statuscode}
+    """
+    urls = {}
+    try:
+        cdx = cdx_toolkit.CDXFetcher(source=source_key)
+        for obj in cdx.iter(f"{host}/*", fl="original,statuscode", limit=5000):
+            url = obj.get("original", "")
+            status = obj.get("statuscode", "-")
+            if url and is_internal(url) and not is_asset(url):
+                n = normalize(url)
+                urls[n] = status
+    except Exception as e:
+        print(f"    [{source_name}] error: {e}")
     return urls
+
+
+def historical_urls(domain):
+    """Query both Wayback Machine (ia) and Common Crawl (cc) via cdx-toolkit."""
+    host = urlparse(domain).netloc or domain
+    all_urls = {}
+
+    print("  [CDX] Querying Wayback Machine (Internet Archive)...")
+    wb = fetch_cdx_source("Wayback", "ia", host)
+    print(f"        {len(wb)} URLs")
+    all_urls.update(wb)
+
+    print("  [CDX] Querying Common Crawl...")
+    cc = fetch_cdx_source("CommonCrawl", "cc", host)
+    print(f"        {len(cc)} URLs ({len(set(cc) - set(wb))} new beyond Wayback)")
+    for url, status in cc.items():
+        if url not in all_urls:
+            all_urls[url] = status
+
+    print(f"  [CDX] Total unique historical URLs: {len(all_urls)}")
+    return all_urls
 
 
 # ── short-slug inference ──────────────────────────────────────────────────────
@@ -374,13 +262,13 @@ def crawl():
     for u in parse_sitemap(f"{BASE_URL}/sitemap_index.xml"):
         enqueue(u, "sitemap")
 
-    # 4. Wayback CDX
-    print("\n[2/4] Fetching Wayback CDX history...")
-    cdx_results = wayback_urls(BASE_URL)
+    # 4. Wayback + Common Crawl CDX
+    print("\n[2/5] Fetching CDX history (Wayback + Common Crawl)...")
+    cdx_results = historical_urls(BASE_URL)
     for u, cdx_status in cdx_results.items():
-        enqueue(u, f"wayback(was:{cdx_status})")
+        enqueue(u, f"cdx(was:{cdx_status})")
 
-    print(f"\n[3/4] Crawling {len(queue)} queued URLs + link extraction...")
+    print(f"\n[3/5] Crawling {len(queue)} queued URLs + link extraction...")
 
     full_slugs = set()
 
@@ -410,7 +298,7 @@ def crawl():
             time.sleep(DELAY)
 
     # 5. short-slug inference
-    print(f"\n[4/4] Inferring short-slug candidates from {len(full_slugs)} full slugs...")
+    print(f"\n[4/5] Inferring short-slug candidates from {len(full_slugs)} full slugs...")
     for full_url in full_slugs:
         for candidate in infer_short_slugs(full_url):
             enqueue(candidate, f"inferred(from:{urlparse(full_url).path})")
