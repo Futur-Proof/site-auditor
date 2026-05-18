@@ -8,27 +8,34 @@ Site auditor — discovers URLs via five sources:
   5. Short-slug inference (abbreviated candidates from full slugs)
 
 Usage:
-  python crawl.py [base_url]
-  python crawl.py https://www.alpharank.ai
+  python crawl.py <url> [options]
+
+Options:
+  --delay FLOAT         Seconds between requests (default: 0.3)
+  --cdx-timeout INT     Seconds before giving up on a CDX source (default: 60)
+  --skip-cdx            Skip Wayback + Common Crawl lookup
+  --skip-infer          Skip short-slug inference
+  --probes PATH,...     Extra paths to probe, comma-separated
+  --output DIR          Directory to write JSON + text report (default: results/)
 """
 
-import sys
+import argparse
+import json
+import os
+import queue
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import deque
+from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
 import cdx_toolkit
 import requests
 from bs4 import BeautifulSoup
 
-BASE_URL = sys.argv[1].rstrip("/") if len(sys.argv) > 1 else "https://www.alpharank.ai"
-PARSED_BASE = urlparse(BASE_URL)
-DELAY = 0.3
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SiteAuditor/2.0)"}
-session = requests.Session()
-session.headers.update(HEADERS)
+# ── constants ─────────────────────────────────────────────────────────────────
 
 ASSET_EXTS = (
     ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp",
@@ -36,11 +43,12 @@ ASSET_EXTS = (
     ".pdf", ".zip", ".mp4", ".mp3",
 )
 
-PROBE_PATHS = [
+STANDARD_PROBES = [
     "/sitemap.xml", "/sitemap_index.xml", "/robots.txt",
     "/terms", "/terms-of-service", "/privacy", "/privacy-policy",
-    "/old-home", "/old-home-2", "/spinthewheel",
-    "/insight-hub", "/partner", "/ready-to-get-going", "/solutions",
+    "/about", "/contact", "/login", "/signup",
+    "/feed", "/feed.xml", "/atom.xml", "/rss.xml",
+    "/404", "/.well-known/security.txt",
 ]
 
 STOP_WORDS = {
@@ -50,31 +58,52 @@ STOP_WORDS = {
     "that", "we", "you", "my", "can", "do", "not", "no", "vs",
 }
 
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SiteAuditor/2.0)"}
 
-# ── helpers ──────────────────────────────────────────────────────────────────
 
-def get(url, allow_redirects=True, timeout=10):
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Site link auditor")
+    p.add_argument("url", help="Base URL to audit (e.g. https://www.example.com)")
+    p.add_argument("--delay", type=float, default=0.3)
+    p.add_argument("--cdx-timeout", type=int, default=60)
+    p.add_argument("--skip-cdx", action="store_true")
+    p.add_argument("--skip-infer", action="store_true")
+    p.add_argument("--probes", default="", help="Extra paths to probe, comma-separated")
+    p.add_argument("--output", default="results", help="Output directory")
+    return p.parse_args()
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def make_session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
+def get(session, url, allow_redirects=True, timeout=10):
     try:
         return session.get(url, allow_redirects=allow_redirects, timeout=timeout)
     except requests.RequestException:
         return None
 
 
-def is_internal(url):
+def is_internal(url, base_host):
     parsed = urlparse(url)
     host = parsed.netloc.lstrip("www.")
-    base_host = PARSED_BASE.netloc.lstrip("www.")
     return parsed.netloc == "" or host == base_host
 
 
-def normalize(url):
+def normalize(url, parsed_base):
     parsed = urlparse(url)
     return parsed._replace(
-        scheme=PARSED_BASE.scheme,
-        netloc=PARSED_BASE.netloc,
+        scheme=parsed_base.scheme,
+        netloc=parsed_base.netloc,
         fragment="",
         query="",
-    ).geturl().rstrip("/") or BASE_URL
+    ).geturl().rstrip("/") or parsed_base.geturl()
 
 
 def is_asset(url):
@@ -82,7 +111,7 @@ def is_asset(url):
     return any(path.endswith(ext) for ext in ASSET_EXTS)
 
 
-def extract_links(html, page_url):
+def extract_links(html, page_url, base_host, parsed_base):
     soup = BeautifulSoup(html, "html.parser")
     links = set()
     for tag in soup.find_all("a", href=True):
@@ -90,22 +119,22 @@ def extract_links(html, page_url):
         if href.startswith(("mailto:", "tel:", "javascript:", "#")):
             continue
         abs_url = urljoin(page_url, href)
-        if is_internal(abs_url) and not is_asset(abs_url):
-            links.add(normalize(abs_url))
+        if is_internal(abs_url, base_host) and not is_asset(abs_url):
+            links.add(normalize(abs_url, parsed_base))
     return links
 
 
 # ── sitemap ───────────────────────────────────────────────────────────────────
 
-def parse_sitemap(url, visited_sitemaps=None):
-    if visited_sitemaps is None:
-        visited_sitemaps = set()
-    if url in visited_sitemaps:
+def parse_sitemap(session, url, base_host, parsed_base, visited=None):
+    if visited is None:
+        visited = set()
+    if url in visited:
         return set()
-    visited_sitemaps.add(url)
+    visited.add(url)
 
     urls = set()
-    r = get(url)
+    r = get(session, url)
     if r is None or r.status_code != 200 or not r.text.strip():
         return urls
     try:
@@ -114,29 +143,17 @@ def parse_sitemap(url, visited_sitemaps=None):
         for loc in root.findall(".//sm:loc", ns):
             href = loc.text.strip()
             if href.endswith(".xml"):
-                urls |= parse_sitemap(href, visited_sitemaps)
-            elif is_internal(href) and not is_asset(href):
-                urls.add(normalize(href))
+                urls |= parse_sitemap(session, href, base_host, parsed_base, visited)
+            elif is_internal(href, base_host) and not is_asset(href):
+                urls.add(normalize(href, parsed_base))
     except ET.ParseError:
         pass
     return urls
 
 
-# ── CDX (Wayback + Common Crawl via cdx-toolkit) ─────────────────────────────
+# ── CDX ───────────────────────────────────────────────────────────────────────
 
-CDX_SOURCE_TIMEOUT = 60  # seconds per source before giving up
-
-
-def fetch_cdx_source(source_name, source_key, host):
-    """
-    Fetch historical URLs from one CDX source using cdx-toolkit.
-    source_key: 'ia' (Internet Archive) or 'cc' (Common Crawl)
-    Runs in a thread with a hard timeout so a slow/hung source doesn't block.
-    Returns dict of {normalized_url: last_known_statuscode}
-    """
-    import queue
-    import threading
-
+def fetch_cdx_source(source_name, source_key, host, base_host, parsed_base, timeout_s):
     result_q = queue.Queue()
 
     def _fetch():
@@ -146,8 +163,8 @@ def fetch_cdx_source(source_name, source_key, host):
             for obj in cdx.iter(f"{host}/*", fl="original,statuscode", limit=5000):
                 url = obj.get("original", "")
                 status = obj.get("statuscode", "-")
-                if url and is_internal(url) and not is_asset(url):
-                    n = normalize(url)
+                if url and is_internal(url, base_host) and not is_asset(url):
+                    n = normalize(url, parsed_base)
                     urls[n] = status
         except Exception as e:
             print(f"    [{source_name}] error: {e}")
@@ -155,28 +172,28 @@ def fetch_cdx_source(source_name, source_key, host):
 
     t = threading.Thread(target=_fetch, daemon=True)
     t.start()
-    t.join(timeout=CDX_SOURCE_TIMEOUT)
+    t.join(timeout=timeout_s)
 
     if t.is_alive():
-        print(f"    [{source_name}] timed out after {CDX_SOURCE_TIMEOUT}s — skipping")
+        print(f"    [{source_name}] timed out after {timeout_s}s — skipping")
         return {}
 
     return result_q.get()
 
 
-def historical_urls(domain):
-    """Query both Wayback Machine (ia) and Common Crawl (cc) via cdx-toolkit."""
-    host = urlparse(domain).netloc or domain
+def historical_urls(base_url, base_host, parsed_base, cdx_timeout):
+    host = urlparse(base_url).netloc or base_url
     all_urls = {}
 
     print("  [CDX] Querying Wayback Machine (Internet Archive)...")
-    wb = fetch_cdx_source("Wayback", "ia", host)
+    wb = fetch_cdx_source("Wayback", "ia", host, base_host, parsed_base, cdx_timeout)
     print(f"        {len(wb)} URLs")
     all_urls.update(wb)
 
     print("  [CDX] Querying Common Crawl...")
-    cc = fetch_cdx_source("CommonCrawl", "cc", host)
-    print(f"        {len(cc)} URLs ({len(set(cc) - set(wb))} new beyond Wayback)")
+    cc = fetch_cdx_source("CommonCrawl", "cc", host, base_host, parsed_base, cdx_timeout)
+    new = len(set(cc) - set(wb))
+    print(f"        {len(cc)} URLs ({new} new beyond Wayback)")
     for url, status in cc.items():
         if url not in all_urls:
             all_urls[url] = status
@@ -187,45 +204,33 @@ def historical_urls(domain):
 
 # ── short-slug inference ──────────────────────────────────────────────────────
 
-def infer_short_slugs(url):
-    """
-    Given a full slug like /post/the-confidence-problem-why-generative-ai-...
-    generate likely abbreviated candidates that may have been the original URLs.
-    """
+def infer_short_slugs(url, base_url, parsed_base):
     parsed = urlparse(url)
     parts = parsed.path.strip("/").split("/")
     if len(parts) < 2:
         return set()
 
-    prefix = "/" + parts[0]  # e.g. /post
-    slug = parts[1]           # e.g. the-confidence-problem-why-...
+    prefix = "/" + parts[0]
+    slug = parts[1]
     words = slug.split("-")
-
-    candidates = set()
-
-    # strip stop words from front
     filtered = [w for w in words if w.lower() not in STOP_WORDS]
 
-    # try first 1, 2, 3 meaningful words
+    candidates = set()
     for n in range(1, min(5, len(filtered) + 1)):
-        short = "-".join(filtered[:n])
-        candidates.add(normalize(BASE_URL + prefix + "/" + short))
-
-    # try first 1, 2, 3 raw words (including stop words)
+        candidates.add(normalize(base_url + prefix + "/" + "-".join(filtered[:n]), parsed_base))
     for n in range(1, min(4, len(words) + 1)):
-        short = "-".join(words[n:n+3]) if n < len(words) else None
-        if short:
-            candidates.add(normalize(BASE_URL + prefix + "/" + short))
+        chunk = "-".join(words[n:n+3]) if n < len(words) else None
+        if chunk:
+            candidates.add(normalize(base_url + prefix + "/" + chunk, parsed_base))
 
-    # drop the candidate if it's identical to the original
-    candidates.discard(normalize(url))
+    candidates.discard(normalize(url, parsed_base))
     return candidates
 
 
 # ── status check ─────────────────────────────────────────────────────────────
 
-def check_url(url):
-    r = get(url, allow_redirects=False)
+def check_url(session, url):
+    r = get(session, url, allow_redirects=False)
     if r is None:
         return {"url": url, "status": "ERROR", "final_url": None, "redirect_chain": []}
 
@@ -236,15 +241,13 @@ def check_url(url):
         chain.append((current.status_code, current.url))
         if not location:
             break
-        next_url = urljoin(current.url, location)
-        current = get(next_url, allow_redirects=False)
+        current = get(session, urljoin(current.url, location), allow_redirects=False)
 
     if current is None:
         return {"url": url, "status": "ERROR", "final_url": None, "redirect_chain": chain}
 
-    body = current.text or ""
     status = current.status_code
-    if status == 200 and not body.strip():
+    if status == 200 and not (current.text or "").strip():
         status = "200-EMPTY"
 
     return {
@@ -255,123 +258,185 @@ def check_url(url):
     }
 
 
-# ── main crawl ────────────────────────────────────────────────────────────────
+# ── crawl ─────────────────────────────────────────────────────────────────────
 
-def crawl():
+def crawl(base_url, delay, cdx_timeout, skip_cdx, skip_infer, extra_probes):
+    parsed_base = urlparse(base_url)
+    base_host = parsed_base.netloc.lstrip("www.")
+    session = make_session()
+
     visited = set()
-    queue = deque()
+    q = deque()
     results = []
     url_source = {}
 
     def enqueue(url, source):
         if url not in visited and url not in url_source:
-            queue.append(url)
+            q.append(url)
             url_source[url] = source
 
-    # 1. probes
-    for path in PROBE_PATHS:
-        enqueue(normalize(BASE_URL + path), "probe")
+    # 1. standard + extra probes
+    all_probes = STANDARD_PROBES + [p if p.startswith("/") else "/" + p for p in extra_probes]
+    for path in all_probes:
+        enqueue(normalize(base_url + path, parsed_base), "probe")
 
-    # 2. homepage seed
-    enqueue(normalize(BASE_URL), "seed")
+    # 2. homepage
+    enqueue(normalize(base_url, parsed_base), "seed")
 
     # 3. sitemap
-    print("\n[1/4] Parsing sitemap...")
-    for u in parse_sitemap(f"{BASE_URL}/sitemap.xml"):
+    print("\n[1] Parsing sitemap...")
+    for u in parse_sitemap(session, f"{base_url}/sitemap.xml", base_host, parsed_base):
         enqueue(u, "sitemap")
-    for u in parse_sitemap(f"{BASE_URL}/sitemap_index.xml"):
+    for u in parse_sitemap(session, f"{base_url}/sitemap_index.xml", base_host, parsed_base):
         enqueue(u, "sitemap")
 
-    # 4. Wayback + Common Crawl CDX
-    print("\n[2/5] Fetching CDX history (Wayback + Common Crawl)...")
-    cdx_results = historical_urls(BASE_URL)
-    for u, cdx_status in cdx_results.items():
-        enqueue(u, f"cdx(was:{cdx_status})")
+    # 4. CDX history
+    if not skip_cdx:
+        print("\n[2] Fetching CDX history (Wayback + Common Crawl)...")
+        for u, status in historical_urls(base_url, base_host, parsed_base, cdx_timeout).items():
+            enqueue(u, f"cdx(was:{status})")
+    else:
+        print("\n[2] CDX skipped")
 
-    print(f"\n[3/5] Crawling {len(queue)} queued URLs + link extraction...")
-
+    # 5. live crawl
     full_slugs = set()
+    print(f"\n[3] Crawling {len(q)} queued URLs + link extraction...")
 
-    while queue:
-        url = queue.popleft()
+    while q:
+        url = q.popleft()
         if url in visited:
             continue
         visited.add(url)
 
-        result = check_url(url)
+        result = check_url(session, url)
         result["source"] = url_source.get(url, "crawl")
         results.append(result)
 
         code = result["status"]
-        redirect_note = f" -> {result['final_url']}" if result["final_url"] else ""
-        print(f"  [{code}] {url}{redirect_note}  ({result['source']})")
+        redir = f" -> {result['final_url']}" if result["final_url"] else ""
+        print(f"  [{code}] {url}{redir}  ({result['source']})")
 
         if code == 200:
-            r = get(url)
+            r = get(session, url)
             if r and "text/html" in r.headers.get("Content-Type", ""):
-                for link in extract_links(r.text, url):
+                for link in extract_links(r.text, url, base_host, parsed_base):
                     enqueue(link, "crawl")
-                    # collect full slugs for inference
-                    path = urlparse(link).path
-                    if path.count("/") >= 2:
+                    if urlparse(link).path.count("/") >= 2:
                         full_slugs.add(link)
-            time.sleep(DELAY)
+            time.sleep(delay)
 
-    # 5. short-slug inference
-    print(f"\n[4/5] Inferring short-slug candidates from {len(full_slugs)} full slugs...")
-    for full_url in full_slugs:
-        for candidate in infer_short_slugs(full_url):
-            enqueue(candidate, f"inferred(from:{urlparse(full_url).path})")
+    # 6. short-slug inference
+    if not skip_infer:
+        print(f"\n[4] Inferring short-slug candidates from {len(full_slugs)} full slugs...")
+        for full_url in full_slugs:
+            for candidate in infer_short_slugs(full_url, base_url, parsed_base):
+                enqueue(candidate, f"inferred(from:{urlparse(full_url).path})")
 
-    while queue:
-        url = queue.popleft()
-        if url in visited:
-            continue
-        visited.add(url)
+        while q:
+            url = q.popleft()
+            if url in visited:
+                continue
+            visited.add(url)
 
-        result = check_url(url)
-        result["source"] = url_source.get(url, "inferred")
-        results.append(result)
+            result = check_url(session, url)
+            result["source"] = url_source.get(url, "inferred")
+            results.append(result)
 
-        code = result["status"]
-        redirect_note = f" -> {result['final_url']}" if result["final_url"] else ""
-        print(f"  [{code}] {url}{redirect_note}  ({result['source']})")
-        time.sleep(DELAY * 0.5)
+            code = result["status"]
+            redir = f" -> {result['final_url']}" if result["final_url"] else ""
+            print(f"  [{code}] {url}{redir}  ({result['source']})")
+            time.sleep(delay * 0.5)
+    else:
+        print("\n[4] Inference skipped")
 
     return results
 
 
-# ── report ────────────────────────────────────────────────────────────────────
+# ── report + output ───────────────────────────────────────────────────────────
 
-def report(results):
-    broken_statuses = (404, 410, "ERROR", "200-EMPTY")
-    broken = [r for r in results if r["status"] in broken_statuses]
+BROKEN_STATUSES = (404, 410, "ERROR", "200-EMPTY")
+
+
+def build_report(base_url, results):
+    broken = [r for r in results if r["status"] in BROKEN_STATUSES]
     redirects = [r for r in results if r["redirect_chain"]]
     live = [r for r in results if r["status"] == 200]
 
-    print("\n" + "=" * 70)
-    print(f"AUDIT COMPLETE — {len(results)} URLs checked")
-    print("=" * 70)
-    print(f"\n  LIVE (200):      {len(live)}")
-    print(f"  REDIRECTS:       {len(redirects)}")
-    print(f"  BROKEN/EMPTY:    {len(broken)}")
+    lines = []
+    lines.append("=" * 70)
+    lines.append(f"AUDIT: {base_url}")
+    lines.append(f"RUN:   {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append(f"TOTAL: {len(results)} URLs checked")
+    lines.append("=" * 70)
+    lines.append(f"\n  LIVE (200):      {len(live)}")
+    lines.append(f"  REDIRECTS:       {len(redirects)}")
+    lines.append(f"  BROKEN/EMPTY:    {len(broken)}")
 
     if broken:
-        print("\n--- BROKEN / EMPTY ---")
+        lines.append("\n--- BROKEN / EMPTY ---")
         for r in sorted(broken, key=lambda x: x["url"]):
-            print(f"  [{r['status']:12}]  {r['url']}")
-            print(f"  {'':14}  source: {r['source']}")
+            lines.append(f"  [{str(r['status']):<12}]  {r['url']}")
+            lines.append(f"  {'':14}  source: {r['source']}")
 
     if redirects:
-        print("\n--- REDIRECTS ---")
+        lines.append("\n--- REDIRECTS ---")
         for r in sorted(redirects, key=lambda x: x["url"]):
             chain_str = " -> ".join(str(c) for c, _ in r["redirect_chain"])
-            final = f"\n  {'':14}  -> {r['final_url']}" if r["final_url"] else ""
-            print(f"  [{chain_str} -> {r['status']}]  {r['url']}{final}")
-            print(f"  {'':14}  source: {r['source']}")
+            lines.append(f"  [{chain_str} -> {r['status']}]  {r['url']}")
+            if r["final_url"]:
+                lines.append(f"  {'':14}  -> {r['final_url']}")
+            lines.append(f"  {'':14}  source: {r['source']}")
 
+    return "\n".join(lines)
+
+
+def save_results(base_url, results, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    host = urlparse(base_url).netloc.replace(".", "_")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+    stem = f"{host}_{ts}"
+
+    json_path = os.path.join(output_dir, f"{stem}.json")
+    txt_path = os.path.join(output_dir, f"{stem}.txt")
+
+    payload = {
+        "url": base_url,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "total": len(results),
+        "results": results,
+    }
+    with open(json_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    report_text = build_report(base_url, results)
+    with open(txt_path, "w") as f:
+        f.write(report_text)
+
+    return json_path, txt_path
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"Target: {BASE_URL}\n")
-    results = crawl()
-    report(results)
+    args = parse_args()
+    base_url = args.url.rstrip("/")
+    extra_probes = [p.strip() for p in args.probes.split(",") if p.strip()]
+
+    print(f"Target: {base_url}\n")
+
+    results = crawl(
+        base_url=base_url,
+        delay=args.delay,
+        cdx_timeout=args.cdx_timeout,
+        skip_cdx=args.skip_cdx,
+        skip_infer=args.skip_infer,
+        extra_probes=extra_probes,
+    )
+
+    report_text = build_report(base_url, results)
+    print("\n" + report_text)
+
+    json_path, txt_path = save_results(base_url, results, args.output)
+    print(f"\nResults saved:")
+    print(f"  JSON: {json_path}")
+    print(f"  Text: {txt_path}")
