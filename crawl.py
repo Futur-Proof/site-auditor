@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Site auditor — discovers URLs via five sources:
+Site auditor — discovers URLs via four sources:
   1. Live crawl (HTML link extraction)
   2. Sitemap (XML, recursive)
   3. Wayback Machine CDX (Internet Archive historical URLs)
   4. Common Crawl CDX (independent corpus via cdx-toolkit)
-  5. Short-slug inference (abbreviated candidates from full slugs)
 
 Usage:
   python crawl.py <url> [options]
@@ -14,7 +13,6 @@ Options:
   --delay FLOAT         Seconds between requests (default: 0.3)
   --cdx-timeout INT     Seconds before giving up on a CDX source (default: 60)
   --skip-cdx            Skip Wayback + Common Crawl lookup
-  --skip-infer          Skip short-slug inference
   --probes PATH,...     Extra paths to probe, comma-separated
   --output DIR          Directory to write JSON + text report (default: results/)
 """
@@ -51,12 +49,6 @@ STANDARD_PROBES = [
     "/404", "/.well-known/security.txt",
 ]
 
-STOP_WORDS = {
-    "the", "a", "an", "and", "or", "in", "of", "for", "to", "with",
-    "how", "why", "what", "your", "our", "is", "it", "its", "at",
-    "on", "by", "from", "be", "are", "was", "were", "as", "this",
-    "that", "we", "you", "my", "can", "do", "not", "no", "vs",
-}
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SiteAuditor/2.0)"}
 
@@ -69,9 +61,6 @@ def parse_args():
     p.add_argument("--delay", type=float, default=0.3)
     p.add_argument("--cdx-timeout", type=int, default=60)
     p.add_argument("--skip-cdx", action="store_true")
-    p.add_argument("--skip-infer", action="store_true")
-    p.add_argument("--show-inferred", action="store_true",
-                   help="Include inferred short-slug 404s in the report (noisy without GSC data)")
     p.add_argument("--probes", default="", help="Extra paths to probe, comma-separated")
     p.add_argument("--output", default="results", help="Output directory")
     return p.parse_args()
@@ -204,31 +193,6 @@ def historical_urls(base_url, base_host, parsed_base, cdx_timeout):
     return all_urls
 
 
-# ── short-slug inference ──────────────────────────────────────────────────────
-
-def infer_short_slugs(url, base_url, parsed_base):
-    parsed = urlparse(url)
-    parts = parsed.path.strip("/").split("/")
-    if len(parts) < 2:
-        return set()
-
-    prefix = "/" + parts[0]
-    slug = parts[1]
-    words = slug.split("-")
-    filtered = [w for w in words if w.lower() not in STOP_WORDS]
-
-    candidates = set()
-    for n in range(1, min(5, len(filtered) + 1)):
-        candidates.add(normalize(base_url + prefix + "/" + "-".join(filtered[:n]), parsed_base))
-    for n in range(1, min(4, len(words) + 1)):
-        chunk = "-".join(words[n:n+3]) if n < len(words) else None
-        if chunk:
-            candidates.add(normalize(base_url + prefix + "/" + chunk, parsed_base))
-
-    candidates.discard(normalize(url, parsed_base))
-    return candidates
-
-
 # ── status check ─────────────────────────────────────────────────────────────
 
 def check_url(session, url):
@@ -262,7 +226,7 @@ def check_url(session, url):
 
 # ── crawl ─────────────────────────────────────────────────────────────────────
 
-def crawl(base_url, delay, cdx_timeout, skip_cdx, skip_infer, extra_probes):
+def crawl(base_url, delay, cdx_timeout, skip_cdx, extra_probes):
     parsed_base = urlparse(base_url)
     base_host = parsed_base.netloc.lstrip("www.")
     session = make_session()
@@ -301,7 +265,6 @@ def crawl(base_url, delay, cdx_timeout, skip_cdx, skip_infer, extra_probes):
         print("\n[2] CDX skipped")
 
     # 5. live crawl
-    full_slugs = set()
     print(f"\n[3] Crawling {len(q)} queued URLs + link extraction...")
 
     while q:
@@ -323,33 +286,7 @@ def crawl(base_url, delay, cdx_timeout, skip_cdx, skip_infer, extra_probes):
             if r and "text/html" in r.headers.get("Content-Type", ""):
                 for link in extract_links(r.text, url, base_host, parsed_base):
                     enqueue(link, "crawl")
-                    if urlparse(link).path.count("/") >= 2:
-                        full_slugs.add(link)
             time.sleep(delay)
-
-    # 6. short-slug inference
-    if not skip_infer:
-        print(f"\n[4] Inferring short-slug candidates from {len(full_slugs)} full slugs...")
-        for full_url in full_slugs:
-            for candidate in infer_short_slugs(full_url, base_url, parsed_base):
-                enqueue(candidate, f"inferred(from:{urlparse(full_url).path})")
-
-        while q:
-            url = q.popleft()
-            if url in visited:
-                continue
-            visited.add(url)
-
-            result = check_url(session, url)
-            result["source"] = url_source.get(url, "inferred")
-            results.append(result)
-
-            code = result["status"]
-            redir = f" -> {result['final_url']}" if result["final_url"] else ""
-            print(f"  [{code}] {url}{redir}  ({result['source']})")
-            time.sleep(delay * 0.5)
-    else:
-        print("\n[4] Inference skipped")
 
     return results
 
@@ -359,18 +296,10 @@ def crawl(base_url, delay, cdx_timeout, skip_cdx, skip_infer, extra_probes):
 BROKEN_STATUSES = (404, 410, "ERROR", "200-EMPTY")
 
 
-def is_inferred(result):
-    return result["source"].startswith("inferred(")
-
-
-def build_report(base_url, results, show_inferred=False):
-    all_broken = [r for r in results if r["status"] in BROKEN_STATUSES]
+def build_report(base_url, results):
+    broken = [r for r in results if r["status"] in BROKEN_STATUSES]
     redirects = [r for r in results if r["redirect_chain"]]
     live = [r for r in results if r["status"] == 200]
-
-    # by default suppress inferred 404s — they're hypothetical without GSC data
-    broken = all_broken if show_inferred else [r for r in all_broken if not is_inferred(r)]
-    hidden_count = len(all_broken) - len(broken)
 
     lines = []
     lines.append("=" * 70)
@@ -381,8 +310,6 @@ def build_report(base_url, results, show_inferred=False):
     lines.append(f"\n  LIVE (200):      {len(live)}")
     lines.append(f"  REDIRECTS:       {len(redirects)}")
     lines.append(f"  BROKEN/EMPTY:    {len(broken)}")
-    if hidden_count:
-        lines.append(f"  (+ {hidden_count} inferred short-slug 404s hidden — run with --show-inferred to include)")
 
     if broken:
         lines.append("\n--- BROKEN / EMPTY ---")
@@ -441,11 +368,10 @@ if __name__ == "__main__":
         delay=args.delay,
         cdx_timeout=args.cdx_timeout,
         skip_cdx=args.skip_cdx,
-        skip_infer=args.skip_infer,
         extra_probes=extra_probes,
     )
 
-    report_text = build_report(base_url, results, show_inferred=args.show_inferred)
+    report_text = build_report(base_url, results)
     print("\n" + report_text)
 
     json_path, txt_path = save_results(base_url, results, args.output)

@@ -1,6 +1,6 @@
 # site-auditor
 
-A site crawler that finds broken links, dead redirects, and ghost URLs — pages Google still has indexed from old site structures that now return 404.
+A site crawler that finds broken links, dead redirects, and ghost URLs — pages that existed historically and may still be indexed by Google but now return 404.
 
 Works on any site. Pass a URL and get a full audit.
 
@@ -29,9 +29,6 @@ python crawl.py https://www.example.com
 # Skip CDX history lookup (faster, live site only)
 python crawl.py https://www.example.com --skip-cdx
 
-# Skip short-slug inference (faster, no guessing)
-python crawl.py https://www.example.com --skip-infer
-
 # Add site-specific paths to probe
 python crawl.py https://www.example.com --probes /old-home,/spinthewheel,/guest-pass
 
@@ -57,7 +54,6 @@ python crawl.py https://www.example.com \
 | `--delay` | `0.3` | Seconds between requests |
 | `--cdx-timeout` | `60` | Seconds before giving up on a CDX source |
 | `--skip-cdx` | off | Skip Wayback + Common Crawl lookup |
-| `--skip-infer` | off | Skip short-slug inference |
 | `--probes` | — | Extra paths to probe, comma-separated |
 | `--output` | `results/` | Directory to write JSON + text report |
 
@@ -134,15 +130,6 @@ Queries two historical URL corpora using [`cdx-toolkit`](https://github.com/cocr
 This is where *ghost URLs* are found — pages that existed on a previous version of the site, were indexed by Google, and now return 404. Neither the live site nor its sitemap knows these exist; only historical crawl data reveals them.
 
 Each source runs in its own thread with a configurable timeout (`--cdx-timeout`). If a source is unavailable (503, network timeout), it fails fast and the crawl continues without it.
-
-### 5. Short-slug inference
-
-For every full URL found during the crawl (e.g. `/post/the-confidence-problem-why-generative-ai-answers-cant-be-trusted`), the auditor generates abbreviated candidates:
-
-- Strip leading stop words, take first 1–4 meaningful words → `/post/confidence-problem`
-- Sliding window of 3-word chunks → `/post/why-generative-ai`
-
-Each candidate is checked live. This catches old short canonical URLs from a previous CMS or URL structure that Google may still index — even when CDX data is unavailable.
 
 ---
 
